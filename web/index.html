@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LAN Traffic Monitor</title>
+    <style>
+      :root {
+        --bg: #f5f7fb;
+        --panel: #ffffff;
+        --text: #162033;
+        --muted: #60708d;
+        --border: #d8dfeb;
+        --accent: #126bff;
+        --accent-soft: #dfeaff;
+        --danger: #dc3f64;
+        --shadow: 0 18px 50px rgba(18, 35, 66, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family:
+          "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+        background:
+          radial-gradient(circle at top right, #dbe8ff 0, transparent 30%),
+          linear-gradient(180deg, #eef3fb 0%, #f8fbff 100%);
+        color: var(--text);
+      }
+
+      .page {
+        width: min(1200px, calc(100vw - 32px));
+        margin: 24px auto 40px;
+      }
+
+      .hero,
+      .panel {
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid rgba(216, 223, 235, 0.9);
+        border-radius: 24px;
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(12px);
+      }
+
+      .hero {
+        padding: 28px;
+        margin-bottom: 20px;
+      }
+
+      .hero h1 {
+        margin: 0 0 8px;
+        font-size: clamp(28px, 4vw, 42px);
+        line-height: 1.05;
+      }
+
+      .hero p {
+        margin: 0;
+        color: var(--muted);
+        max-width: 720px;
+      }
+
+      .filters {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px;
+        margin-top: 22px;
+      }
+
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .field label {
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .field select,
+      .field input,
+      .field button {
+        width: 100%;
+        min-height: 44px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        padding: 0 14px;
+        font-size: 14px;
+        background: #fff;
+        color: var(--text);
+      }
+
+      .field button {
+        cursor: pointer;
+        font-weight: 600;
+        background: var(--accent);
+        color: #fff;
+        border-color: transparent;
+      }
+
+      .field button.secondary {
+        background: var(--accent-soft);
+        color: var(--accent);
+      }
+
+      .field button.danger {
+        background: #fff0f4;
+        color: var(--danger);
+      }
+
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 14px;
+        margin-bottom: 20px;
+      }
+
+      .card {
+        padding: 18px;
+      }
+
+      .card .label {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .card .value {
+        margin-top: 8px;
+        font-size: 26px;
+        font-weight: 700;
+      }
+
+      .panel {
+        padding: 18px;
+        margin-bottom: 18px;
+      }
+
+      .panel h2 {
+        margin: 0 0 14px;
+        font-size: 18px;
+      }
+
+      #trendCanvas {
+        width: 100%;
+        height: 260px;
+        display: block;
+        border-radius: 18px;
+        background: linear-gradient(180deg, #f8fbff 0%, #eef4ff 100%);
+        border: 1px solid var(--border);
+      }
+
+      .status {
+        min-height: 20px;
+        margin: 10px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .status.error {
+        color: var(--danger);
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th,
+      td {
+        text-align: left;
+        padding: 12px 10px;
+        border-bottom: 1px solid #edf1f7;
+        font-size: 14px;
+      }
+
+      th {
+        color: var(--muted);
+        font-weight: 600;
+      }
+
+      tbody tr:hover {
+        background: #f8fbff;
+      }
+
+      .rank {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .empty {
+        text-align: center;
+        color: var(--muted);
+        padding: 28px 0;
+      }
+
+      @media (max-width: 720px) {
+        .page {
+          width: min(100vw - 20px, 1200px);
+          margin-top: 10px;
+        }
+
+        .hero,
+        .panel {
+          border-radius: 18px;
+        }
+
+        th,
+        td {
+          font-size: 13px;
+          padding: 10px 8px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <section class="hero">
+        <h1>LAN Traffic Monitor</h1>
+        <p>
+          独立流量页面。Go 后端持续轮询 Mihomo 并写入 SQLite，这里只负责查看历史流量。
+        </p>
+
+        <div class="filters">
+          <div class="field">
+            <label for="dimension">聚合维度</label>
+            <select id="dimension">
+              <option value="sourceIP">设备</option>
+              <option value="host">目标主机</option>
+              <option value="outbound">出口节点</option>
+              <option value="process">进程</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="range">时间范围</label>
+            <select id="range">
+              <option value="3600000">最近 1 小时</option>
+              <option value="86400000">最近 24 小时</option>
+              <option value="2592000000">最近 30 天</option>
+              <option value="-1">自定义</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="start">开始时间</label>
+            <input id="start" type="datetime-local" />
+          </div>
+
+          <div class="field">
+            <label for="end">结束时间</label>
+            <input id="end" type="datetime-local" />
+          </div>
+
+          <div class="field">
+            <label>&nbsp;</label>
+            <button id="refreshBtn">刷新数据</button>
+          </div>
+
+          <div class="field">
+            <label>&nbsp;</label>
+            <button id="clearBtn" class="danger">清空历史</button>
+          </div>
+        </div>
+
+        <div id="status" class="status"></div>
+      </section>
+
+      <section class="cards">
+        <div class="panel card">
+          <div class="label">分组数量</div>
+          <div class="value" id="countValue">0</div>
+        </div>
+        <div class="panel card">
+          <div class="label">上传总量</div>
+          <div class="value" id="uploadValue">0 B</div>
+        </div>
+        <div class="panel card">
+          <div class="label">下载总量</div>
+          <div class="value" id="downloadValue">0 B</div>
+        </div>
+        <div class="panel card">
+          <div class="label">总流量</div>
+          <div class="value" id="totalValue">0 B</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>流量趋势</h2>
+        <canvas id="trendCanvas" width="1100" height="260"></canvas>
+      </section>
+
+      <section class="panel">
+        <h2>聚合统计</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th id="labelHeader">标签</th>
+              <th>上传</th>
+              <th>下载</th>
+              <th>总量</th>
+              <th>样本数</th>
+            </tr>
+          </thead>
+          <tbody id="tableBody">
+            <tr>
+              <td colspan="6" class="empty">加载中...</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+    </div>
+
+    <script>
+      const dimensionMap = {
+        sourceIP: '设备',
+        host: '目标主机',
+        outbound: '出口节点',
+        process: '进程',
+      }
+
+      const elements = {
+        dimension: document.getElementById('dimension'),
+        range: document.getElementById('range'),
+        start: document.getElementById('start'),
+        end: document.getElementById('end'),
+        refreshBtn: document.getElementById('refreshBtn'),
+        clearBtn: document.getElementById('clearBtn'),
+        status: document.getElementById('status'),
+        countValue: document.getElementById('countValue'),
+        uploadValue: document.getElementById('uploadValue'),
+        downloadValue: document.getElementById('downloadValue'),
+        totalValue: document.getElementById('totalValue'),
+        tableBody: document.getElementById('tableBody'),
+        labelHeader: document.getElementById('labelHeader'),
+        trendCanvas: document.getElementById('trendCanvas'),
+      }
+      let lastTrendPoints = []
+
+      function nowLocalInputValue(offsetMs) {
+        const date = new Date(Date.now() + offsetMs)
+        const pad = (value) => String(value).padStart(2, '0')
+        return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+      }
+
+      function updateCustomInputs() {
+        const range = Number(elements.range.value)
+        const end = Date.now()
+        const start = range === -1 ? end - 86400000 : end - range
+        elements.start.value = nowLocalInputValue(start - end)
+        elements.end.value = nowLocalInputValue(0)
+      }
+
+      function getTimeRange() {
+        if (Number(elements.range.value) === -1) {
+          return {
+            start: new Date(elements.start.value).getTime(),
+            end: new Date(elements.end.value).getTime(),
+          }
+        }
+
+        const end = Date.now()
+        return {
+          end,
+          start: end - Number(elements.range.value),
+        }
+      }
+
+      function bucketSize(start, end) {
+        const range = end - start
+        if (range <= 3600000) return 60000
+        if (range <= 86400000) return 300000
+        if (range <= 604800000) return 3600000
+        return 86400000
+      }
+
+      function formatBytes(bytes) {
+        if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+        const units = ['B', 'KB', 'MB', 'GB', 'TB']
+        let value = bytes
+        let idx = 0
+        while (value >= 1024 && idx < units.length - 1) {
+          value /= 1024
+          idx += 1
+        }
+        return `${value.toFixed(value >= 10 || idx === 0 ? 0 : 1)} ${units[idx]}`
+      }
+
+      function setStatus(text, isError = false) {
+        elements.status.textContent = text
+        elements.status.className = isError ? 'status error' : 'status'
+      }
+
+      async function fetchJSON(path, params) {
+        const url = new URL(path, window.location.origin)
+        Object.entries(params || {}).forEach(([key, value]) => {
+          url.searchParams.set(key, String(value))
+        })
+
+        const response = await fetch(url)
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}))
+          throw new Error(payload.error || `Request failed: ${response.status}`)
+        }
+        return response.json()
+      }
+
+      function renderCards(rows) {
+        const upload = rows.reduce((sum, row) => sum + row.upload, 0)
+        const download = rows.reduce((sum, row) => sum + row.download, 0)
+        elements.countValue.textContent = String(rows.length)
+        elements.uploadValue.textContent = formatBytes(upload)
+        elements.downloadValue.textContent = formatBytes(download)
+        elements.totalValue.textContent = formatBytes(upload + download)
+      }
+
+      function renderTable(rows) {
+        elements.labelHeader.textContent = dimensionMap[elements.dimension.value]
+
+        if (!rows.length) {
+          elements.tableBody.innerHTML =
+            '<tr><td colspan="6" class="empty">当前时间范围内没有数据</td></tr>'
+          return
+        }
+
+        elements.tableBody.innerHTML = rows
+          .slice(0, 100)
+          .map(
+            (row, index) => `
+              <tr>
+                <td><span class="rank">${index + 1}</span></td>
+                <td>${escapeHTML(row.label)}</td>
+                <td>${formatBytes(row.upload)}</td>
+                <td>${formatBytes(row.download)}</td>
+                <td>${formatBytes(row.total)}</td>
+                <td>${row.count}</td>
+              </tr>
+            `,
+          )
+          .join('')
+      }
+
+      function renderTrend(points) {
+        lastTrendPoints = points
+        const canvas = elements.trendCanvas
+        const ctx = canvas.getContext('2d')
+        const width = canvas.width
+        const height = canvas.height
+        ctx.clearRect(0, 0, width, height)
+
+        const values = points.map((point) => point.upload + point.download)
+        const max = Math.max(...values, 1)
+        const left = 56
+        const right = width - 16
+        const top = 16
+        const bottom = height - 28
+
+        ctx.strokeStyle = '#dbe4f2'
+        ctx.lineWidth = 1
+        for (let i = 0; i <= 4; i += 1) {
+          const y = top + ((bottom - top) / 4) * i
+          ctx.beginPath()
+          ctx.moveTo(left, y)
+          ctx.lineTo(right, y)
+          ctx.stroke()
+        }
+
+        ctx.fillStyle = '#60708d'
+        ctx.font = '12px sans-serif'
+        ctx.fillText(formatBytes(max), 8, top + 4)
+        ctx.fillText('0 B', 16, bottom)
+
+        if (!points.length) return
+
+        const gradient = ctx.createLinearGradient(0, top, 0, bottom)
+        gradient.addColorStop(0, 'rgba(18, 107, 255, 0.30)')
+        gradient.addColorStop(1, 'rgba(18, 107, 255, 0.02)')
+
+        ctx.beginPath()
+        points.forEach((point, index) => {
+          const x = left + ((right - left) * index) / Math.max(points.length - 1, 1)
+          const y = bottom - ((bottom - top) * (point.upload + point.download)) / max
+          if (index === 0) ctx.moveTo(x, y)
+          else ctx.lineTo(x, y)
+        })
+
+        ctx.strokeStyle = '#126bff'
+        ctx.lineWidth = 3
+        ctx.stroke()
+
+        ctx.lineTo(right, bottom)
+        ctx.lineTo(left, bottom)
+        ctx.closePath()
+        ctx.fillStyle = gradient
+        ctx.fill()
+      }
+
+      function escapeHTML(text) {
+        return String(text)
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&#39;')
+      }
+
+      async function loadData() {
+        const { start, end } = getTimeRange()
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start <= 0 || end <= 0 || end < start) {
+          setStatus('时间范围无效', true)
+          return
+        }
+
+        setStatus('加载中...')
+        elements.refreshBtn.disabled = true
+
+        try {
+          const [rows, trend] = await Promise.all([
+            fetchJSON('/api/traffic/aggregate', {
+              dimension: elements.dimension.value,
+              start,
+              end,
+            }),
+            fetchJSON('/api/traffic/trend', {
+              start,
+              end,
+              bucket: bucketSize(start, end),
+            }),
+          ])
+
+          renderCards(rows)
+          renderTable(rows)
+          renderTrend(trend)
+          setStatus(`已加载 ${new Date().toLocaleString()}`)
+        } catch (error) {
+          console.error(error)
+          setStatus(error.message || '加载失败', true)
+        } finally {
+          elements.refreshBtn.disabled = false
+        }
+      }
+
+      async function clearLogs() {
+        if (!window.confirm('确认清空所有历史流量记录吗？')) return
+
+        setStatus('正在清空...')
+        elements.clearBtn.disabled = true
+
+        try {
+          const response = await fetch('/api/traffic/logs', { method: 'DELETE' })
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}))
+            throw new Error(payload.error || '清空失败')
+          }
+          await loadData()
+        } catch (error) {
+          console.error(error)
+          setStatus(error.message || '清空失败', true)
+        } finally {
+          elements.clearBtn.disabled = false
+        }
+      }
+
+      elements.range.addEventListener('change', () => {
+        if (Number(elements.range.value) !== -1) {
+          updateCustomInputs()
+        }
+      })
+
+      elements.refreshBtn.addEventListener('click', loadData)
+      elements.clearBtn.addEventListener('click', clearLogs)
+      window.addEventListener('resize', () => renderTrend(lastTrendPoints))
+
+      updateCustomInputs()
+      loadData()
+      setInterval(loadData, 30000)
+    </script>
+  </body>
+</html>

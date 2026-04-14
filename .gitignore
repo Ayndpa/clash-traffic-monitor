@@ -1,0 +1,8 @@
+.DS_Store
+.env
+data/
+*.db
+*.db-shm
+*.db-wal
+traffic-monitor-enhanced
+dist/
