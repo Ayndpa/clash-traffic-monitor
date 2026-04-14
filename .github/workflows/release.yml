@@ -10,7 +10,7 @@ permissions:
   packages: write
 
 env:
-  APP_DIR: traffic-monitor
+  APP_DIR: .
   IMAGE_NAME: zhf883680/clash-traffic-monitor
 
 jobs:
@@ -89,7 +89,7 @@ jobs:
         with:
           go-version: '1.21'
           cache: true
-          cache-dependency-path: traffic-monitor/go.sum
+          cache-dependency-path: go.sum
 
       - name: Install cross-compilers
         if: matrix.target == 'binary'
@@ -114,8 +114,8 @@ jobs:
           VERSION=${{ steps.version.outputs.version }}
           OUTPUT_NAME=traffic-monitor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           echo "Building $OUTPUT_NAME version $VERSION"
-          go build -ldflags="-s -w" -o "../$OUTPUT_NAME" main.go
-          chmod +x "../$OUTPUT_NAME" || true
+          go build -ldflags="-s -w" -o "./$OUTPUT_NAME" main.go
+          chmod +x "./$OUTPUT_NAME" || true
 
       - name: Upload to Release
         if: matrix.target == 'binary'
