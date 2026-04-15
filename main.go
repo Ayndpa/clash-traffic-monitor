@@ -35,13 +35,15 @@ type config struct {
 }
 
 type trafficLog struct {
-	Timestamp int64  `json:"timestamp"`
-	SourceIP  string `json:"sourceIP"`
-	Host      string `json:"host"`
-	Process   string `json:"process"`
-	Outbound  string `json:"outbound"`
-	Upload    int64  `json:"upload"`
-	Download  int64  `json:"download"`
+	Timestamp     int64    `json:"timestamp"`
+	SourceIP      string   `json:"sourceIP"`
+	Host          string   `json:"host"`
+	DestinationIP string   `json:"destinationIP"`
+	Process       string   `json:"process"`
+	Outbound      string   `json:"outbound"`
+	Chains        []string `json:"chains"`
+	Upload        int64    `json:"upload"`
+	Download      int64    `json:"download"`
 }
 
 type aggregatedData struct {
@@ -56,6 +58,18 @@ type trendPoint struct {
 	Timestamp int64 `json:"timestamp"`
 	Upload    int64 `json:"upload"`
 	Download  int64 `json:"download"`
+}
+
+type connectionDetail struct {
+	DestinationIP string   `json:"destinationIP"`
+	SourceIP      string   `json:"sourceIP"`
+	Process       string   `json:"process"`
+	Outbound      string   `json:"outbound"`
+	Chains        []string `json:"chains"`
+	Upload        int64    `json:"upload"`
+	Download      int64    `json:"download"`
+	Total         int64    `json:"total"`
+	Count         int64    `json:"count"`
 }
 
 type connection struct {
@@ -141,7 +155,7 @@ func main() {
 func loadConfig() (config, error) {
 	cfg := config{
 		ListenAddr:    getenv("TRAFFIC_MONITOR_LISTEN", ":8080"),
-		MihomoURL:     strings.TrimRight(getenv("MIHOMO_URL", getenv("CLASH_API", "http://127.0.0.1:9090")), "/"),
+		MihomoURL:     strings.TrimRight(getenv("MIHOMO_URL", getenv("CLASH_API", "http://192.168.120.254:9999")), "/"),
 		MihomoSecret:  getenv("MIHOMO_SECRET", getenv("CLASH_SECRET", "")),
 		DatabasePath:  getenv("TRAFFIC_MONITOR_DB", "./traffic_monitor.db"),
 		RetentionDays: getenvInt("TRAFFIC_MONITOR_RETENTION_DAYS", 30),
@@ -176,8 +190,10 @@ func openDatabase(path string) (*sql.DB, error) {
 		timestamp INTEGER NOT NULL,
 		source_ip TEXT NOT NULL,
 		host TEXT NOT NULL,
+		destination_ip TEXT NOT NULL DEFAULT '',
 		process TEXT NOT NULL,
 		outbound TEXT NOT NULL,
+		chains TEXT NOT NULL DEFAULT '[]',
 		upload INTEGER NOT NULL,
 		download INTEGER NOT NULL
 	);
@@ -192,6 +208,16 @@ func openDatabase(path string) (*sql.DB, error) {
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, err
+	}
+
+	for _, stmt := range []string{
+		`ALTER TABLE traffic_logs ADD COLUMN destination_ip TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE traffic_logs ADD COLUMN chains TEXT NOT NULL DEFAULT '[]'`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			db.Close()
+			return nil, err
+		}
 	}
 
 	return db, nil
@@ -294,13 +320,15 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 		}
 
 		logs = append(logs, trafficLog{
-			Timestamp: nowMS,
-			SourceIP:  defaultString(conn.Metadata.SourceIP, "Inner"),
-			Host:      defaultString(firstNonEmpty(conn.Metadata.Host, conn.Metadata.DestinationIP), "Unknown"),
-			Process:   defaultString(conn.Metadata.Process, "Unknown"),
-			Outbound:  outboundName(conn.Chains),
-			Upload:    uploadDelta,
-			Download:  downloadDelta,
+			Timestamp:     nowMS,
+			SourceIP:      defaultString(conn.Metadata.SourceIP, "Inner"),
+			Host:          defaultString(firstNonEmpty(conn.Metadata.Host, conn.Metadata.DestinationIP), "Unknown"),
+			DestinationIP: strings.TrimSpace(conn.Metadata.DestinationIP),
+			Process:       defaultString(conn.Metadata.Process, "Unknown"),
+			Outbound:      outboundName(conn.Chains),
+			Chains:        sanitizeChains(conn.Chains),
+			Upload:        uploadDelta,
+			Download:      downloadDelta,
 		})
 
 		s.lastConnections[conn.ID] = conn
@@ -338,8 +366,8 @@ func (s *service) insertLogs(logs []trafficLog) error {
 	}
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO traffic_logs (timestamp, source_ip, host, process, outbound, upload, download)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO traffic_logs (timestamp, source_ip, host, destination_ip, process, outbound, chains, upload, download)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		tx.Rollback()
@@ -348,12 +376,20 @@ func (s *service) insertLogs(logs []trafficLog) error {
 	defer stmt.Close()
 
 	for _, entry := range logs {
+		chainsJSON, err := json.Marshal(sanitizeChains(entry.Chains))
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+
 		if _, err := stmt.Exec(
 			entry.Timestamp,
 			entry.SourceIP,
 			entry.Host,
+			entry.DestinationIP,
 			entry.Process,
 			entry.Outbound,
+			string(chainsJSON),
 			entry.Upload,
 			entry.Download,
 		); err != nil {
@@ -385,6 +421,7 @@ func (s *service) routes() http.Handler {
 	mux.HandleFunc("/api/traffic/proxy-stats", s.handleProxyStats)
 	mux.HandleFunc("/api/traffic/devices-by-host", s.handleDevicesByHost)
 	mux.HandleFunc("/api/traffic/devices-by-proxy-host", s.handleDevicesByProxyHost)
+	mux.HandleFunc("/api/traffic/details", s.handleConnectionDetails)
 	mux.HandleFunc("/api/traffic/trend", s.handleTrend)
 	mux.HandleFunc("/api/traffic/logs", s.handleLogs)
 	return s.withCORS(mux)
@@ -572,6 +609,33 @@ func (s *service) handleTrend(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, data)
 }
 
+func (s *service) handleConnectionDetails(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w)
+		return
+	}
+
+	dimension := r.URL.Query().Get("dimension")
+	primary := r.URL.Query().Get("primary")
+	secondary := r.URL.Query().Get("secondary")
+	start, end, err := parseTimeRange(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if primary == "" || secondary == "" {
+		writeError(w, http.StatusBadRequest, errors.New("primary and secondary are required"))
+		return
+	}
+
+	data, err := s.queryConnectionDetails(dimension, primary, secondary, start, end)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, data)
+}
+
 func (s *service) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		writeMethodNotAllowed(w)
@@ -653,6 +717,58 @@ func (s *service) queryByFilters(groupColumn, extraFilter string, extraArgs []an
 	return results, rows.Err()
 }
 
+func (s *service) queryConnectionDetails(dimension, primary, secondary string, start, end int64) ([]connectionDetail, error) {
+	filter, args, err := detailFilter(dimension, primary, secondary)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := s.db.Query(`
+		SELECT destination_ip,
+		       source_ip,
+		       process,
+		       outbound,
+		       chains,
+		       COALESCE(SUM(upload), 0) AS upload,
+		       COALESCE(SUM(download), 0) AS download,
+		       COALESCE(SUM(upload + download), 0) AS total,
+		       COUNT(*) AS count
+		FROM traffic_logs
+		WHERE timestamp BETWEEN ? AND ?
+		  AND `+filter+`
+		GROUP BY destination_ip, source_ip, process, outbound, chains
+		ORDER BY total DESC, destination_ip ASC, source_ip ASC, process ASC
+	`, append([]any{start, end}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	results := make([]connectionDetail, 0)
+	for rows.Next() {
+		var (
+			item      connectionDetail
+			chainsRaw string
+		)
+		if err := rows.Scan(
+			&item.DestinationIP,
+			&item.SourceIP,
+			&item.Process,
+			&item.Outbound,
+			&chainsRaw,
+			&item.Upload,
+			&item.Download,
+			&item.Total,
+			&item.Count,
+		); err != nil {
+			return nil, err
+		}
+		item.Chains = parseChains(chainsRaw)
+		results = append(results, item)
+	}
+	return results, rows.Err()
+}
+
 func (s *service) queryTrend(start, end, bucket int64) ([]trendPoint, error) {
 	rows, err := s.db.Query(`
 		SELECT ((timestamp / ?) * ?) AS bucket_start,
@@ -719,11 +835,56 @@ func dimensionColumn(dimension string) (string, error) {
 	}
 }
 
+func detailFilter(dimension, primary, secondary string) (string, []any, error) {
+	switch dimension {
+	case "sourceIP":
+		return "source_ip = ? AND host = ?", []any{primary, secondary}, nil
+	case "host":
+		return "host = ? AND source_ip = ?", []any{primary, secondary}, nil
+	case "outbound":
+		return "outbound = ? AND host = ?", []any{primary, secondary}, nil
+	case "process":
+		return "process = ? AND host = ?", []any{primary, secondary}, nil
+	default:
+		return "", nil, fmt.Errorf("unsupported dimension %q", dimension)
+	}
+}
+
 func outboundName(chains []string) string {
 	if len(chains) == 0 || chains[0] == "" {
 		return "DIRECT"
 	}
 	return chains[0]
+}
+
+func sanitizeChains(chains []string) []string {
+	if len(chains) == 0 {
+		return []string{"DIRECT"}
+	}
+
+	cleaned := make([]string, 0, len(chains))
+	for _, chain := range chains {
+		chain = strings.TrimSpace(chain)
+		if chain != "" {
+			cleaned = append(cleaned, chain)
+		}
+	}
+	if len(cleaned) == 0 {
+		return []string{"DIRECT"}
+	}
+	return cleaned
+}
+
+func parseChains(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return []string{"DIRECT"}
+	}
+
+	var chains []string
+	if err := json.Unmarshal([]byte(raw), &chains); err != nil {
+		return []string{raw}
+	}
+	return sanitizeChains(chains)
 }
 
 func defaultString(value, fallback string) string {

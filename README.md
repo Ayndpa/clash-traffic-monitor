@@ -10,8 +10,19 @@
 - 使用 SQLite 持久化保存历史数据
 - 自带单页 Web 界面，无需额外前端部署
 - 支持按来源 IP、域名、进程、出站分组聚合统计
+- 支持继续下钻查看目标 IP、节点链路、进程和设备关系
 - 提供趋势查询接口和历史清理接口
 - 适合直接用 Docker 部署
+
+## 页面预览
+
+### 聚合与趋势视图
+
+![Traffic Monitor 聚合与趋势视图](./readmeImg/traffic1.png)
+
+### 链路钻取视图
+
+![Traffic Monitor 链路钻取视图](./readmeImg/traffic2.png)
 
 ## 内置 Web 界面
 
@@ -141,3 +152,13 @@ curl -X DELETE http://localhost:8080/api/traffic/logs
 - 将流量增量持久化写入 SQLite
 - 当 Mihomo 计数器回退时重置内存中的基线
 - 服务重启后仍能保留历史数据
+
+## 参考项目
+
+当前独立页面的流量监控与交互设计参考了 `MetaCubeX/metacubexd` 项目中的流量与连接页面能力，并在此基础上做了更轻量的独立部署实现。
+
+参考仓库：
+
+```text
+https://github.com/MetaCubeX/metacubexd
+```
