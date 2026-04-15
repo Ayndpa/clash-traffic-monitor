@@ -9,20 +9,14 @@
 - 定时稳定采集 Mihomo 连接流量
 - 使用 SQLite 持久化保存历史数据
 - 自带单页 Web 界面，无需额外前端部署
-- 支持按来源 IP、域名、进程、出站分组聚合统计
-- 支持继续下钻查看目标 IP、节点链路、进程和设备关系
+- 支持按来源 IP、域名、出站分组聚合统计
+- 支持继续下钻查看访问对象与节点链路明细
 - 提供趋势查询接口和历史清理接口
 - 适合直接用 Docker 部署
 
 ## 页面预览
 
-### 聚合与趋势视图
-
-![Traffic Monitor 聚合与趋势视图](./readmeImg/traffic1.png)
-
-### 链路钻取视图
-
-![Traffic Monitor 链路钻取视图](./readmeImg/traffic2.png)
+![Traffic Monitor 页面预览](./readmeImg/image.png)
 
 ## 内置 Web 界面
 
