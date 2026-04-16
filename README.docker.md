@@ -13,7 +13,6 @@ docker run -d \
   -p 8080:8080 \
   -e MIHOMO_URL=http://host.docker.internal:9090 \
   -e MIHOMO_SECRET=your-secret \
-  -e TRAFFIC_MONITOR_DB=/data/traffic_monitor.db \
   -v "$(pwd)/data:/data" \
   zhf883680/clash-traffic-monitor:latest
 ```
@@ -31,9 +30,13 @@ http://localhost:8080/
 | `MIHOMO_URL` | `http://127.0.0.1:9090` | Mihomo Controller 地址 |
 | `MIHOMO_SECRET` | 空 | Mihomo Bearer Token |
 | `TRAFFIC_MONITOR_LISTEN` | `:8080` | 服务监听地址 |
-| `TRAFFIC_MONITOR_DB` | `./traffic_monitor.db` | 数据库路径 |
-| `TRAFFIC_MONITOR_POLL_INTERVAL_MS` | `2000` | 采集间隔，单位毫秒 |
-| `TRAFFIC_MONITOR_RETENTION_DAYS` | `30` | 数据保留天数 |
+
+## 存储说明
+
+- 容器内数据库文件固定为 `/data/traffic_monitor.db`，因此持久化时应挂载到 `/data`。
+- 本地直接运行二进制时，默认路径会切换到 `./data/traffic_monitor.db`，不会去写根目录 `/data`。
+- 运行时只持久化 30 天分钟级聚合数据。
+- 最近最多 10 分钟的数据先保存在内存里，按批次刷盘，以减少磁盘 IO。
 
 ## 页面预览
 

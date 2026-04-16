@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,14 +26,24 @@ import (
 //go:embed web/*
 var webAssets embed.FS
 
+const (
+	defaultListenAddr      = ":8080"
+	defaultMihomoURL       = "http://127.0.0.1:9090"
+	defaultPollInterval    = 5 * time.Second
+	aggregateFlushInterval = 10 * time.Minute
+	aggregateRetention     = 30 * 24 * time.Hour
+	defaultAllowedOrigin   = "*"
+)
+
+var isContainerRuntime = func() bool {
+	_, err := os.Stat("/.dockerenv")
+	return err == nil
+}
+
 type config struct {
-	ListenAddr    string
-	MihomoURL     string
-	MihomoSecret  string
-	DatabasePath  string
-	PollInterval  time.Duration
-	RetentionDays int
-	AllowedOrigin string
+	ListenAddr   string
+	MihomoURL    string
+	MihomoSecret string
 }
 
 type trafficLog struct {
@@ -125,7 +136,7 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	db, err := openDatabase(cfg.DatabasePath)
+	db, err := openDatabase(defaultDatabasePath())
 	if err != nil {
 		log.Fatalf("open database: %v", err)
 	}
@@ -185,19 +196,10 @@ func main() {
 
 func loadConfig() (config, error) {
 	cfg := config{
-		ListenAddr:    getenv("TRAFFIC_MONITOR_LISTEN", ":8080"),
-		MihomoURL:     strings.TrimRight(getenv("MIHOMO_URL", getenv("CLASH_API", "http://192.168.120.254:9999")), "/"),
-		MihomoSecret:  getenv("MIHOMO_SECRET", getenv("CLASH_SECRET", "")),
-		DatabasePath:  getenv("TRAFFIC_MONITOR_DB", "./traffic_monitor.db"),
-		RetentionDays: getenvInt("TRAFFIC_MONITOR_RETENTION_DAYS", 30),
-		AllowedOrigin: getenv("TRAFFIC_MONITOR_ALLOWED_ORIGIN", "*"),
+		ListenAddr:   getenv("TRAFFIC_MONITOR_LISTEN", defaultListenAddr),
+		MihomoURL:    strings.TrimRight(getenv("MIHOMO_URL", defaultMihomoURL), "/"),
+		MihomoSecret: getenv("MIHOMO_SECRET", ""),
 	}
-
-	pollMS := getenvInt("TRAFFIC_MONITOR_POLL_INTERVAL_MS", 5000)
-	if pollMS < 1000 {
-		pollMS = 1000
-	}
-	cfg.PollInterval = time.Duration(pollMS) * time.Millisecond
 
 	if cfg.MihomoURL == "" {
 		return config{}, errors.New("MIHOMO_URL is required")
@@ -206,7 +208,18 @@ func loadConfig() (config, error) {
 	return cfg, nil
 }
 
+func defaultDatabasePath() string {
+	if isContainerRuntime() {
+		return "/data/traffic_monitor.db"
+	}
+	return "./data/traffic_monitor.db"
+}
+
 func openDatabase(path string) (*sql.DB, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, err
@@ -329,7 +342,7 @@ func backfillAggregatedLogs(db *sql.DB, beforeMS int64) error {
 func (s *service) runCollector(ctx context.Context) {
 	s.collectOnce(ctx)
 
-	ticker := time.NewTicker(s.cfg.PollInterval)
+	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -443,10 +456,6 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 	s.mu.Unlock()
 
 	if len(logs) > 0 {
-		if err := s.insertLogs(logs); err != nil {
-			return err
-		}
-
 		if err := s.addToAggregateBuffer(logs, nowMS); err != nil {
 			return err
 		}
@@ -456,7 +465,7 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 		log.Printf("flush aggregate buffer: %v", err)
 	}
 
-	if s.cfg.RetentionDays > 0 && time.Since(s.lastCleanup) >= time.Hour {
+	if time.Since(s.lastCleanup) >= time.Hour {
 		if err := s.cleanupOldLogs(nowMS); err != nil {
 			log.Printf("cleanup old logs: %v", err)
 		} else {
@@ -510,15 +519,11 @@ func (s *service) insertLogs(logs []trafficLog) error {
 }
 
 func (s *service) cleanupOldLogs(nowMS int64) error {
-	cutoff := nowMS - int64(time.Duration(s.cfg.RetentionDays)*24*time.Hour/time.Millisecond)
-
-	// 删除旧日志
-	if _, err := s.db.Exec(`DELETE FROM traffic_logs WHERE timestamp < ?`, cutoff); err != nil {
+	if _, err := s.db.Exec(`DELETE FROM traffic_logs`); err != nil {
 		return err
 	}
 
-	// 删除旧聚合数据（保留更长时间）
-	aggCutoff := nowMS - int64(time.Duration(s.cfg.RetentionDays*2)*24*time.Hour/time.Millisecond)
+	aggCutoff := nowMS - int64(aggregateRetention/time.Millisecond)
 	if _, err := s.db.Exec(`DELETE FROM traffic_aggregated WHERE bucket_end < ?`, aggCutoff); err != nil {
 		return err
 	}
@@ -574,7 +579,7 @@ func (s *service) addToAggregateBuffer(logs []trafficLog, nowMS int64) error {
 }
 
 func (s *service) flushCompletedAggregateBuckets(nowMS int64) error {
-	currentBucketStart := (nowMS / 60000) * 60000
+	currentBucketStart := (nowMS / int64(aggregateFlushInterval/time.Millisecond)) * int64(aggregateFlushInterval/time.Millisecond)
 	return s.flushAggregateEntries(func(entry *aggregatedEntry) bool {
 		return entry.BucketEnd <= currentBucketStart
 	})
@@ -670,11 +675,7 @@ func (s *service) routes() http.Handler {
 
 func (s *service) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := s.cfg.AllowedOrigin
-		if origin == "" {
-			origin = "*"
-		}
-		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Origin", defaultAllowedOrigin)
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
@@ -942,39 +943,15 @@ func (s *service) queryProxyStats(dimension, parentLabel, host string, start, en
 }
 
 func (s *service) queryByFilters(groupColumn, extraFilter string, extraArgs []any, start, end int64) ([]aggregatedData, error) {
-	timeRange := end - start
-	if timeRange <= 3600000 {
-		return s.queryByFiltersFromRaw(groupColumn, extraFilter, extraArgs, start, end)
-	}
-
 	merged := make(map[string]*aggregatedData)
-	aggregateStart, aggregateEndExclusive := fullMinuteBucketRange(start, end)
 
-	if aggregateStart < aggregateEndExclusive {
-		items, err := s.queryByFiltersFromAggregates(groupColumn, extraFilter, extraArgs, aggregateStart, aggregateEndExclusive)
-		if err != nil {
-			return nil, err
-		}
-		mergeAggregatedDataRows(merged, items)
+	items, err := s.queryByFiltersFromAggregates(groupColumn, extraFilter, extraArgs, start, end)
+	if err != nil {
+		return nil, err
 	}
+	mergeAggregatedDataRows(merged, items)
 
-	headEnd := minInt64(end, aggregateStart-1)
-	if start <= headEnd {
-		items, err := s.queryByFiltersFromRaw(groupColumn, extraFilter, extraArgs, start, headEnd)
-		if err != nil {
-			return nil, err
-		}
-		mergeAggregatedDataRows(merged, items)
-	}
-
-	tailStart := maxInt64(start, aggregateEndExclusive)
-	if tailStart <= end {
-		items, err := s.queryByFiltersFromRaw(groupColumn, extraFilter, extraArgs, tailStart, end)
-		if err != nil {
-			return nil, err
-		}
-		mergeAggregatedDataRows(merged, items)
-	}
+	mergeAggregatedDataRows(merged, s.queryByFiltersFromBuffer(groupColumn, extraFilter, extraArgs, start, end))
 
 	return sortedAggregatedDataRows(merged), nil
 }
@@ -994,19 +971,18 @@ func (s *service) queryConnectionDetails(dimension, primary, secondary string, s
 		       COALESCE(SUM(upload), 0) AS upload,
 		       COALESCE(SUM(download), 0) AS download,
 		       COALESCE(SUM(upload + download), 0) AS total,
-		       COUNT(*) AS count
-		FROM traffic_logs
-		WHERE timestamp BETWEEN ? AND ?
+		       COALESCE(SUM(count), 0) AS count
+		FROM traffic_aggregated
+		WHERE bucket_end > ? AND bucket_start <= ?
 		  AND `+filter+`
 		GROUP BY destination_ip, source_ip, process, outbound, chains
-		ORDER BY total DESC, destination_ip ASC, source_ip ASC, process ASC
 	`, append([]any{start, end}, args...)...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	results := make([]connectionDetail, 0)
+	merged := make(map[string]*connectionDetail)
 	for rows.Next() {
 		var (
 			item      connectionDetail
@@ -1026,48 +1002,25 @@ func (s *service) queryConnectionDetails(dimension, primary, secondary string, s
 			return nil, err
 		}
 		item.Chains = parseChains(chainsRaw)
-		results = append(results, item)
+		mergeConnectionDetailRows(merged, []connectionDetail{item})
 	}
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	mergeConnectionDetailRows(merged, s.queryConnectionDetailsFromBuffer(filter, args, start, end))
+	return sortedConnectionDetailRows(merged), nil
 }
 
 func (s *service) queryTrend(start, end, bucket int64) ([]trendPoint, error) {
 	buckets := make(map[int64]trendPoint)
 
-	if bucket >= 60000 {
-		aggregateStart, aggregateEndExclusive := fullMinuteBucketRange(start, end)
-		if aggregateStart < aggregateEndExclusive {
-			items, err := s.queryTrendFromAggregates(aggregateStart, aggregateEndExclusive, bucket)
-			if err != nil {
-				return nil, err
-			}
-			mergeTrendPoints(buckets, items)
-		}
-
-		headEnd := minInt64(end, aggregateStart-1)
-		if start <= headEnd {
-			items, err := s.queryTrendFromRaw(start, headEnd, bucket)
-			if err != nil {
-				return nil, err
-			}
-			mergeTrendPoints(buckets, items)
-		}
-
-		tailStart := maxInt64(start, aggregateEndExclusive)
-		if tailStart <= end {
-			items, err := s.queryTrendFromRaw(tailStart, end, bucket)
-			if err != nil {
-				return nil, err
-			}
-			mergeTrendPoints(buckets, items)
-		}
-	} else {
-		items, err := s.queryTrendFromRaw(start, end, bucket)
-		if err != nil {
-			return nil, err
-		}
-		mergeTrendPoints(buckets, items)
+	items, err := s.queryTrendFromAggregates(start, end, bucket)
+	if err != nil {
+		return nil, err
 	}
+	mergeTrendPoints(buckets, items)
+	mergeTrendPoints(buckets, s.queryTrendFromBuffer(start, end, bucket))
 
 	points := make([]trendPoint, 0, (end-start)/bucket+1)
 	for t := start; t <= end; t += bucket {
@@ -1096,13 +1049,41 @@ func (s *service) queryByFiltersFromRaw(groupColumn, extraFilter string, extraAr
 func (s *service) queryByFiltersFromAggregates(groupColumn, extraFilter string, extraArgs []any, start, endExclusive int64) ([]aggregatedData, error) {
 	return s.queryByFiltersFromTable(
 		"traffic_aggregated",
-		"bucket_start >= ? AND bucket_start < ?",
+		"bucket_end > ? AND bucket_start <= ?",
 		[]any{start, endExclusive},
 		groupColumn,
 		extraFilter,
 		extraArgs,
 		"COALESCE(SUM(count), 0)",
 	)
+}
+
+func (s *service) queryByFiltersFromBuffer(groupColumn, extraFilter string, extraArgs []any, start, end int64) []aggregatedData {
+	items := s.snapshotAggregateEntries(func(entry *aggregatedEntry) bool {
+		return aggregateEntryOverlapsRange(*entry, start, end)
+	})
+
+	merged := make(map[string]*aggregatedData)
+	for _, entry := range items {
+		if !matchesAggregateEntryFilters(entry, extraFilter, extraArgs) {
+			continue
+		}
+		label := aggregateEntryFieldValue(entry, groupColumn)
+		if label == "" {
+			continue
+		}
+		row, ok := merged[label]
+		if !ok {
+			row = &aggregatedData{Label: label}
+			merged[label] = row
+		}
+		row.Upload += entry.Upload
+		row.Download += entry.Download
+		row.Total += entry.Upload + entry.Download
+		row.Count += entry.Count
+	}
+
+	return sortedAggregatedDataRows(merged)
 }
 
 func (s *service) queryByFiltersFromTable(table, timeFilter string, timeArgs []any, groupColumn, extraFilter string, extraArgs []any, countExpr string) ([]aggregatedData, error) {
@@ -1174,7 +1155,7 @@ func (s *service) queryTrendFromAggregates(start, endExclusive, bucket int64) ([
 		       COALESCE(SUM(upload), 0) AS upload,
 		       COALESCE(SUM(download), 0) AS download
 		FROM traffic_aggregated
-		WHERE bucket_start >= ? AND bucket_start < ?
+		WHERE bucket_end > ? AND bucket_start <= ?
 		GROUP BY bucket_start
 		ORDER BY bucket_start ASC
 	`, bucket, bucket, start, endExclusive)
@@ -1192,6 +1173,105 @@ func (s *service) queryTrendFromAggregates(start, endExclusive, bucket int64) ([
 		results = append(results, point)
 	}
 	return results, rows.Err()
+}
+
+func (s *service) queryTrendFromBuffer(start, end, bucket int64) []trendPoint {
+	items := s.snapshotAggregateEntries(func(entry *aggregatedEntry) bool {
+		return aggregateEntryOverlapsRange(*entry, start, end)
+	})
+
+	merged := make(map[int64]trendPoint)
+	for _, entry := range items {
+		key := (entry.BucketStart / bucket) * bucket
+		point := merged[key]
+		point.Timestamp = key
+		point.Upload += entry.Upload
+		point.Download += entry.Download
+		merged[key] = point
+	}
+
+	results := make([]trendPoint, 0, len(merged))
+	for _, item := range merged {
+		results = append(results, item)
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Timestamp < results[j].Timestamp
+	})
+	return results
+}
+
+func (s *service) queryConnectionDetailsFromBuffer(filter string, args []any, start, end int64) []connectionDetail {
+	items := s.snapshotAggregateEntries(func(entry *aggregatedEntry) bool {
+		return aggregateEntryOverlapsRange(*entry, start, end)
+	})
+
+	merged := make(map[string]*connectionDetail)
+	for _, entry := range items {
+		if !matchesAggregateEntryFilters(entry, filter, args) {
+			continue
+		}
+		item := connectionDetail{
+			DestinationIP: entry.DestinationIP,
+			SourceIP:      entry.SourceIP,
+			Process:       entry.Process,
+			Outbound:      entry.Outbound,
+			Chains:        parseChains(entry.Chains),
+			Upload:        entry.Upload,
+			Download:      entry.Download,
+			Total:         entry.Upload + entry.Download,
+			Count:         entry.Count,
+		}
+		mergeConnectionDetailRows(merged, []connectionDetail{item})
+	}
+
+	return sortedConnectionDetailRows(merged)
+}
+
+func aggregateEntryOverlapsRange(entry aggregatedEntry, start, end int64) bool {
+	return entry.BucketEnd > start && entry.BucketStart <= end
+}
+
+func matchesAggregateEntryFilters(entry aggregatedEntry, filter string, args []any) bool {
+	if filter == "" {
+		return true
+	}
+
+	clauses := strings.Split(filter, " AND ")
+	if len(clauses) != len(args) {
+		return false
+	}
+
+	for i, clause := range clauses {
+		column := strings.TrimSpace(strings.TrimSuffix(clause, "= ?"))
+		column = strings.TrimSpace(strings.TrimSuffix(column, " = ?"))
+		if column == "" {
+			return false
+		}
+		if aggregateEntryFieldValue(entry, column) != fmt.Sprint(args[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func aggregateEntryFieldValue(entry aggregatedEntry, column string) string {
+	switch column {
+	case "source_ip":
+		return entry.SourceIP
+	case "host":
+		return entry.Host
+	case "destination_ip":
+		return entry.DestinationIP
+	case "process":
+		return entry.Process
+	case "outbound":
+		return entry.Outbound
+	case "chains":
+		return entry.Chains
+	default:
+		return ""
+	}
 }
 
 func fullMinuteBucketRange(start, end int64) (int64, int64) {
@@ -1236,6 +1316,52 @@ func sortedAggregatedDataRows(items map[string]*aggregatedData) []aggregatedData
 		return results[i].Total > results[j].Total
 	})
 	return results
+}
+
+func mergeConnectionDetailRows(target map[string]*connectionDetail, items []connectionDetail) {
+	for _, item := range items {
+		key := connectionDetailKey(item)
+		existing, ok := target[key]
+		if !ok {
+			copyItem := item
+			target[key] = &copyItem
+			continue
+		}
+		existing.Upload += item.Upload
+		existing.Download += item.Download
+		existing.Total += item.Total
+		existing.Count += item.Count
+	}
+}
+
+func sortedConnectionDetailRows(items map[string]*connectionDetail) []connectionDetail {
+	results := make([]connectionDetail, 0, len(items))
+	for _, item := range items {
+		results = append(results, *item)
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Total == results[j].Total {
+			if results[i].DestinationIP == results[j].DestinationIP {
+				if results[i].SourceIP == results[j].SourceIP {
+					return results[i].Process < results[j].Process
+				}
+				return results[i].SourceIP < results[j].SourceIP
+			}
+			return results[i].DestinationIP < results[j].DestinationIP
+		}
+		return results[i].Total > results[j].Total
+	})
+	return results
+}
+
+func connectionDetailKey(item connectionDetail) string {
+	return strings.Join([]string{
+		item.DestinationIP,
+		item.SourceIP,
+		item.Process,
+		item.Outbound,
+		strings.Join(item.Chains, "\x1f"),
+	}, "\x00")
 }
 
 func mergeTrendPoints(target map[int64]trendPoint, items []trendPoint) {

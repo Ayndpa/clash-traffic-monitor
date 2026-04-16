@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Traffic Monitor</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <style>
       :root {
         --bg: #f3f6fb;
@@ -1388,6 +1389,17 @@
 
       elements.range.addEventListener("change", () => {
         if (Number(elements.range.value) !== -1) updateCustomInputs()
+        loadData()
+      })
+
+      elements.start.addEventListener("change", () => {
+        elements.range.value = "-1"
+        loadData()
+      })
+
+      elements.end.addEventListener("change", () => {
+        elements.range.value = "-1"
+        loadData()
       })
 
       elements.dimensionTabs.forEach((button) => {

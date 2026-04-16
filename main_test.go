@@ -5,21 +5,23 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestQueryAggregate(t *testing.T) {
 	svc := newTestService(t)
 
-	insertTestLogs(t, svc.db, []trafficLog{
-		{Timestamp: 1000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Upload: 100, Download: 200},
-		{Timestamp: 1500, SourceIP: "192.168.1.2", Host: "b.com", Process: "chrome", Outbound: "NodeA", Upload: 50, Download: 20},
-		{Timestamp: 2000, SourceIP: "192.168.1.3", Host: "a.com", Process: "curl", Outbound: "DIRECT", Upload: 10, Download: 30},
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 100, Download: 200, Count: 1},
+		{BucketStart: 60_000, BucketEnd: 120_000, SourceIP: "192.168.1.2", Host: "b.com", Process: "chrome", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 50, Download: 20, Count: 1},
+		{BucketStart: 60_000, BucketEnd: 120_000, SourceIP: "192.168.1.3", Host: "a.com", Process: "curl", Outbound: "DIRECT", Chains: `["DIRECT"]`, Upload: 10, Download: 30, Count: 1},
 	})
 
-	got, err := svc.queryAggregate("sourceIP", 500, 3000)
+	got, err := svc.queryAggregate("sourceIP", 1, 120_000)
 	if err != nil {
 		t.Fatalf("queryAggregate: %v", err)
 	}
@@ -35,12 +37,12 @@ func TestQueryAggregate(t *testing.T) {
 func TestQueryTrendFillsEmptyBuckets(t *testing.T) {
 	svc := newTestService(t)
 
-	insertTestLogs(t, svc.db, []trafficLog{
-		{Timestamp: 1000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Upload: 100, Download: 200},
-		{Timestamp: 4100, SourceIP: "192.168.1.2", Host: "b.com", Process: "chrome", Outbound: "NodeA", Upload: 50, Download: 20},
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 100, Download: 200, Count: 1},
+		{BucketStart: 120_000, BucketEnd: 180_000, SourceIP: "192.168.1.2", Host: "b.com", Process: "chrome", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 50, Download: 20, Count: 1},
 	})
 
-	got, err := svc.queryTrend(1000, 7000, 2000)
+	got, err := svc.queryTrend(0, 180_000, 60_000)
 	if err != nil {
 		t.Fatalf("queryTrend: %v", err)
 	}
@@ -48,10 +50,10 @@ func TestQueryTrendFillsEmptyBuckets(t *testing.T) {
 	if len(got) != 4 {
 		t.Fatalf("expected 4 buckets, got %d", len(got))
 	}
-	if got[1].Timestamp != 2000 || got[1].Upload != 0 || got[1].Download != 0 {
+	if got[1].Timestamp != 60_000 || got[1].Upload != 0 || got[1].Download != 0 {
 		t.Fatalf("expected empty middle bucket, got %+v", got[1])
 	}
-	if got[2].Timestamp != 4000 || got[2].Upload != 50 || got[2].Download != 20 {
+	if got[2].Timestamp != 120_000 || got[2].Upload != 50 || got[2].Download != 20 {
 		t.Fatalf("unexpected populated bucket: %+v", got[2])
 	}
 }
@@ -88,7 +90,126 @@ func TestOpenDatabaseAddsDetailColumns(t *testing.T) {
 	}
 }
 
-func TestProcessConnectionsStoresDetailFields(t *testing.T) {
+func TestLoadConfigDefaultsRetentionPolicy(t *testing.T) {
+	for _, key := range []string{
+		"TRAFFIC_MONITOR_LISTEN",
+		"MIHOMO_URL",
+		"MIHOMO_SECRET",
+		"TRAFFIC_MONITOR_DB",
+		"TRAFFIC_MONITOR_POLL_INTERVAL_MS",
+		"TRAFFIC_MONITOR_RETENTION_DAYS",
+		"TRAFFIC_MONITOR_AGG_RETENTION_DAYS",
+		"TRAFFIC_MONITOR_ALLOWED_ORIGIN",
+	} {
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatalf("unsetenv %s: %v", key, err)
+		}
+	}
+
+	if err := os.Setenv("CLASH_API", "http://10.0.0.2:9090"); err != nil {
+		t.Fatalf("setenv CLASH_API: %v", err)
+	}
+	if err := os.Setenv("CLASH_SECRET", "legacy-secret"); err != nil {
+		t.Fatalf("setenv CLASH_SECRET: %v", err)
+	}
+	if err := os.Setenv("TRAFFIC_MONITOR_DB", "/tmp/override.db"); err != nil {
+		t.Fatalf("setenv TRAFFIC_MONITOR_DB: %v", err)
+	}
+	if err := os.Setenv("TRAFFIC_MONITOR_RETENTION_DAYS", "90"); err != nil {
+		t.Fatalf("setenv TRAFFIC_MONITOR_RETENTION_DAYS: %v", err)
+	}
+	if err := os.Setenv("TRAFFIC_MONITOR_AGG_RETENTION_DAYS", "120"); err != nil {
+		t.Fatalf("setenv TRAFFIC_MONITOR_AGG_RETENTION_DAYS: %v", err)
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+
+	if cfg.ListenAddr != ":8080" {
+		t.Fatalf("expected listen addr default to be :8080, got %q", cfg.ListenAddr)
+	}
+	if cfg.MihomoURL != "http://127.0.0.1:9090" {
+		t.Fatalf("expected mihomo url default to be http://127.0.0.1:9090, got %q", cfg.MihomoURL)
+	}
+	if cfg.MihomoSecret != "" {
+		t.Fatalf("expected mihomo secret default to be empty, got %q", cfg.MihomoSecret)
+	}
+	original := isContainerRuntime
+	isContainerRuntime = func() bool { return false }
+	t.Cleanup(func() {
+		isContainerRuntime = original
+	})
+	if defaultDatabasePath() != "./data/traffic_monitor.db" {
+		t.Fatalf("expected local default database path to be ./data/traffic_monitor.db, got %q", defaultDatabasePath())
+	}
+}
+
+func TestDefaultDatabasePathUsesContainerDataDir(t *testing.T) {
+	original := isContainerRuntime
+	isContainerRuntime = func() bool { return true }
+	t.Cleanup(func() {
+		isContainerRuntime = original
+	})
+
+	if defaultDatabasePath() != "/data/traffic_monitor.db" {
+		t.Fatalf("expected container default database path to be /data/traffic_monitor.db, got %q", defaultDatabasePath())
+	}
+}
+
+func TestOpenDatabaseCreatesParentDirectory(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "nested", "traffic_monitor.db")
+
+	db, err := openDatabase(dbPath)
+	if err != nil {
+		t.Fatalf("openDatabase: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+
+	if _, err := os.Stat(filepath.Dir(dbPath)); err != nil {
+		t.Fatalf("expected parent dir to exist: %v", err)
+	}
+}
+
+func TestCleanupOldLogsKeepsThirtyDaysOfAggregates(t *testing.T) {
+	svc := newTestService(t)
+
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.Local).UnixMilli()
+
+	insertTestLogs(t, svc.db, []trafficLog{
+		{Timestamp: now - int64(4*24*time.Hour/time.Millisecond), SourceIP: "old-raw", Host: "a.com", Process: "chrome", Outbound: "NodeA", Upload: 1, Download: 1},
+		{Timestamp: now - int64(2*24*time.Hour/time.Millisecond), SourceIP: "keep-raw", Host: "a.com", Process: "chrome", Outbound: "NodeA", Upload: 2, Download: 2},
+	})
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: now - int64(31*24*time.Hour/time.Millisecond), BucketEnd: now - int64(31*24*time.Hour/time.Millisecond) + 60000, SourceIP: "old-agg", Host: "a.com", Process: "chrome", Outbound: "NodeA", Chains: `["DIRECT"]`, Upload: 3, Download: 3, Count: 1},
+		{BucketStart: now - int64(20*24*time.Hour/time.Millisecond), BucketEnd: now - int64(20*24*time.Hour/time.Millisecond) + 60000, SourceIP: "keep-agg", Host: "a.com", Process: "chrome", Outbound: "NodeA", Chains: `["DIRECT"]`, Upload: 4, Download: 4, Count: 1},
+	})
+
+	if err := svc.cleanupOldLogs(now); err != nil {
+		t.Fatalf("cleanupOldLogs: %v", err)
+	}
+
+	var rawCount int
+	if err := svc.db.QueryRow(`SELECT COUNT(*) FROM traffic_logs`).Scan(&rawCount); err != nil {
+		t.Fatalf("count traffic_logs: %v", err)
+	}
+	if rawCount != 0 {
+		t.Fatalf("expected cleanup to remove persisted raw logs, got %d rows", rawCount)
+	}
+
+	var aggregateCount int
+	if err := svc.db.QueryRow(`SELECT COUNT(*) FROM traffic_aggregated`).Scan(&aggregateCount); err != nil {
+		t.Fatalf("count traffic_aggregated: %v", err)
+	}
+	if aggregateCount != 1 {
+		t.Fatalf("expected 1 aggregate row after cleanup, got %d", aggregateCount)
+	}
+}
+
+func TestProcessConnectionsBuffersAggregatesWithoutPersistingRawLogs(t *testing.T) {
 	svc := newTestService(t)
 
 	payload := &connectionsResponse{
@@ -117,49 +238,32 @@ func TestProcessConnectionsStoresDetailFields(t *testing.T) {
 		t.Fatalf("processConnections: %v", err)
 	}
 
-	var (
-		host          string
-		destinationIP string
-		outbound      string
-		chainsRaw     string
-	)
-	err := svc.db.QueryRow(`
-		SELECT host, destination_ip, outbound, chains
-		FROM traffic_logs
-		LIMIT 1
-	`).Scan(&host, &destinationIP, &outbound, &chainsRaw)
-	if err != nil {
-		t.Fatalf("query stored log: %v", err)
+	var rawCount int
+	if err := svc.db.QueryRow(`SELECT COUNT(*) FROM traffic_logs`).Scan(&rawCount); err != nil {
+		t.Fatalf("count traffic_logs: %v", err)
+	}
+	if rawCount != 0 {
+		t.Fatalf("expected no raw logs to be persisted, got %d", rawCount)
 	}
 
-	if host != "api.example.com" {
-		t.Fatalf("unexpected host: %q", host)
+	if len(svc.aggregateBuffer) != 1 {
+		t.Fatalf("expected 1 aggregate buffer entry, got %d", len(svc.aggregateBuffer))
 	}
-	if destinationIP != "1.1.1.1" {
-		t.Fatalf("unexpected destination_ip: %q", destinationIP)
-	}
-	if outbound != "ProxyA" {
-		t.Fatalf("unexpected outbound: %q", outbound)
-	}
-
-	var chains []string
-	if err := json.Unmarshal([]byte(chainsRaw), &chains); err != nil {
-		t.Fatalf("unmarshal chains: %v", err)
-	}
-	if len(chains) != 2 || chains[0] != "ProxyA" || chains[1] != "RelayB" {
-		t.Fatalf("unexpected chains: %#v", chains)
+	for _, entry := range svc.aggregateBuffer {
+		if entry.Host != "api.example.com" || entry.DestinationIP != "1.1.1.1" {
+			t.Fatalf("unexpected aggregate entry: %+v", entry)
+		}
+		if entry.Outbound != "ProxyA" || entry.Process != "curl" {
+			t.Fatalf("unexpected routing fields: %+v", entry)
+		}
+		if entry.Upload != 128 || entry.Download != 256 || entry.Count != 1 {
+			t.Fatalf("unexpected aggregate totals: %+v", entry)
+		}
 	}
 }
 
-func TestQueryAggregateLongRangeIncludesRawBoundaryData(t *testing.T) {
+func TestQueryAggregateIncludesBufferedData(t *testing.T) {
 	svc := newTestService(t)
-
-	insertTestLogs(t, svc.db, []trafficLog{
-		{Timestamp: 30_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Upload: 10, Download: 20},
-		{Timestamp: 60_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Upload: 30, Download: 40},
-		{Timestamp: 120_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Upload: 50, Download: 60},
-		{Timestamp: 3_660_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Upload: 70, Download: 80},
-	})
 
 	insertTestAggregates(t, svc.db, []aggregatedEntry{
 		{
@@ -174,21 +278,23 @@ func TestQueryAggregateLongRangeIncludesRawBoundaryData(t *testing.T) {
 			Download:    40,
 			Count:       1,
 		},
-		{
-			BucketStart: 120_000,
-			BucketEnd:   180_000,
-			SourceIP:    "192.168.1.2",
-			Host:        "a.com",
-			Process:     "chrome",
-			Outbound:    "NodeA",
-			Chains:      `["DIRECT"]`,
-			Upload:      50,
-			Download:    60,
-			Count:       1,
-		},
 	})
 
-	got, err := svc.queryAggregate("sourceIP", 30_000, 3_660_000)
+	svc.aggregateBuffer["pending"] = &aggregatedEntry{
+		BucketStart:   120_000,
+		BucketEnd:     180_000,
+		SourceIP:      "192.168.1.2",
+		Host:          "a.com",
+		DestinationIP: "1.1.1.1",
+		Process:       "chrome",
+		Outbound:      "NodeA",
+		Chains:        `["DIRECT"]`,
+		Upload:        50,
+		Download:      60,
+		Count:         1,
+	}
+
+	got, err := svc.queryAggregate("sourceIP", 60_000, 180_000)
 	if err != nil {
 		t.Fatalf("queryAggregate: %v", err)
 	}
@@ -196,7 +302,7 @@ func TestQueryAggregateLongRangeIncludesRawBoundaryData(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(got))
 	}
-	if got[0].Upload != 160 || got[0].Download != 200 || got[0].Total != 360 || got[0].Count != 4 {
+	if got[0].Upload != 80 || got[0].Download != 100 || got[0].Total != 180 || got[0].Count != 2 {
 		t.Fatalf("unexpected aggregated result: %+v", got[0])
 	}
 }
@@ -223,6 +329,43 @@ func TestQueryTrendRebucketsAggregatedMinuteData(t *testing.T) {
 		t.Fatalf("unexpected first bucket: %+v", got[0])
 	}
 	if got[1].Timestamp != 300_000 || got[1].Upload != 0 || got[1].Download != 0 {
+		t.Fatalf("unexpected second bucket: %+v", got[1])
+	}
+}
+
+func TestQueryTrendIncludesBufferedData(t *testing.T) {
+	svc := newTestService(t)
+
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Chains: `["DIRECT"]`, Upload: 10, Download: 20, Count: 1},
+	})
+
+	svc.aggregateBuffer["pending"] = &aggregatedEntry{
+		BucketStart:   60_000,
+		BucketEnd:     120_000,
+		SourceIP:      "192.168.1.2",
+		Host:          "a.com",
+		DestinationIP: "1.1.1.1",
+		Process:       "chrome",
+		Outbound:      "NodeA",
+		Chains:        `["DIRECT"]`,
+		Upload:        30,
+		Download:      40,
+		Count:         1,
+	}
+
+	got, err := svc.queryTrend(0, 120_000, 60_000)
+	if err != nil {
+		t.Fatalf("queryTrend: %v", err)
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("expected 3 buckets, got %d", len(got))
+	}
+	if got[0].Timestamp != 0 || got[0].Upload != 10 || got[0].Download != 20 {
+		t.Fatalf("unexpected first bucket: %+v", got[0])
+	}
+	if got[1].Timestamp != 60_000 || got[1].Upload != 30 || got[1].Download != 40 {
 		t.Fatalf("unexpected second bucket: %+v", got[1])
 	}
 }
@@ -271,43 +414,49 @@ func TestHandleLogsClearsAggregatesAndBuffer(t *testing.T) {
 func TestHandleConnectionDetailsReturnsGroupedDetails(t *testing.T) {
 	svc := newTestService(t)
 
-	insertTestLogs(t, svc.db, []trafficLog{
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
 		{
-			Timestamp:     1000,
+			BucketStart:   0,
+			BucketEnd:     60_000,
 			SourceIP:      "192.168.1.2",
 			Host:          "a.com",
 			DestinationIP: "1.1.1.1",
 			Process:       "chrome",
 			Outbound:      "NodeA",
-			Chains:        []string{"NodeA", "RelayA"},
+			Chains:        `["NodeA","RelayA"]`,
 			Upload:        100,
 			Download:      200,
+			Count:         1,
 		},
 		{
-			Timestamp:     1100,
+			BucketStart:   60_000,
+			BucketEnd:     120_000,
 			SourceIP:      "192.168.1.2",
 			Host:          "a.com",
 			DestinationIP: "1.1.1.1",
 			Process:       "chrome",
 			Outbound:      "NodeA",
-			Chains:        []string{"NodeA", "RelayA"},
+			Chains:        `["NodeA","RelayA"]`,
 			Upload:        10,
 			Download:      20,
+			Count:         1,
 		},
 		{
-			Timestamp:     1200,
+			BucketStart:   0,
+			BucketEnd:     60_000,
 			SourceIP:      "192.168.1.3",
 			Host:          "a.com",
 			DestinationIP: "8.8.8.8",
 			Process:       "curl",
 			Outbound:      "NodeB",
-			Chains:        []string{"NodeB"},
+			Chains:        `["NodeB"]`,
 			Upload:        30,
 			Download:      40,
+			Count:         1,
 		},
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/api/traffic/details?dimension=host&primary=a.com&secondary=192.168.1.2&start=500&end=2000", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/traffic/details?dimension=host&primary=a.com&secondary=192.168.1.2&start=1&end=120000", nil)
 	rec := httptest.NewRecorder()
 
 	svc.handleConnectionDetails(rec, req)
@@ -341,6 +490,45 @@ func TestHandleConnectionDetailsReturnsGroupedDetails(t *testing.T) {
 	}
 }
 
+func TestHandleConnectionDetailsIncludesBufferedData(t *testing.T) {
+	svc := newTestService(t)
+
+	svc.aggregateBuffer["pending"] = &aggregatedEntry{
+		BucketStart:   120_000,
+		BucketEnd:     180_000,
+		SourceIP:      "192.168.1.2",
+		Host:          "a.com",
+		DestinationIP: "1.1.1.1",
+		Process:       "chrome",
+		Outbound:      "NodeA",
+		Chains:        `["NodeA","RelayA"]`,
+		Upload:        15,
+		Download:      25,
+		Count:         1,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/traffic/details?dimension=host&primary=a.com&secondary=192.168.1.2&start=1&end=180000", nil)
+	rec := httptest.NewRecorder()
+
+	svc.handleConnectionDetails(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var got []connectionDetail
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("expected 1 grouped detail, got %d", len(got))
+	}
+	if got[0].Upload != 15 || got[0].Download != 25 || got[0].Count != 1 {
+		t.Fatalf("unexpected buffered detail aggregates: %+v", got[0])
+	}
+}
+
 func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 	content, err := webAssets.ReadFile("web/index.html")
 	if err != nil {
@@ -350,6 +538,24 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 	html := string(content)
 	if !strings.Contains(html, `elements.refreshBtn.addEventListener("click", loadData)`) {
 		t.Fatalf("expected manual refresh handler to remain available")
+	}
+	if !strings.Contains(html, `elements.range.addEventListener("change", () => {`) {
+		t.Fatalf("expected range change handler to exist")
+	}
+	if !strings.Contains(html, "if (Number(elements.range.value) !== -1) updateCustomInputs()") {
+		t.Fatalf("expected preset range change to keep custom inputs in sync")
+	}
+	if !strings.Contains(html, `elements.start.addEventListener("change", () => {`) {
+		t.Fatalf("expected custom start time change handler to exist")
+	}
+	if !strings.Contains(html, `elements.end.addEventListener("change", () => {`) {
+		t.Fatalf("expected custom end time change handler to exist")
+	}
+	if !strings.Contains(html, `elements.range.value = "-1"`) {
+		t.Fatalf("expected manual datetime edits to switch range into custom mode")
+	}
+	if !strings.Contains(html, `elements.start.addEventListener("change", () => {`) || !strings.Contains(html, `loadData()`) {
+		t.Fatalf("expected manual time edits to request fresh data")
 	}
 	if strings.Contains(html, "setInterval(loadData, 30000)") {
 		t.Fatalf("expected periodic auto refresh to be removed")
