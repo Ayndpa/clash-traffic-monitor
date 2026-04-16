@@ -9,4 +9,4 @@ dist/
 .codex
 __debug*
 .idea/
-
+.docs/
