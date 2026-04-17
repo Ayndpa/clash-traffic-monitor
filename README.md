@@ -38,7 +38,6 @@
 下载文件：`traffic-monitor-windows-amd64.exe`
 
 ```powershell
-$env:MIHOMO_URL="http://127.0.0.1:9090"
 .\traffic-monitor-windows-amd64.exe
 ```
 
@@ -51,12 +50,12 @@ $env:MIHOMO_URL="http://127.0.0.1:9090"
 
 ```bash
 chmod +x ./traffic-monitor-linux-amd64
-MIHOMO_URL=http://127.0.0.1:9090 ./traffic-monitor-linux-amd64
+./traffic-monitor-linux-amd64
 ```
 
 ```bash
 chmod +x ./traffic-monitor-linux-arm64
-MIHOMO_URL=http://127.0.0.1:9090 ./traffic-monitor-linux-arm64
+./traffic-monitor-linux-arm64
 ```
 
 #### macOS
@@ -65,7 +64,14 @@ MIHOMO_URL=http://127.0.0.1:9090 ./traffic-monitor-linux-arm64
 
 ```bash
 chmod +x ./traffic-monitor-macos-arm64
-MIHOMO_URL=http://127.0.0.1:9090 ./traffic-monitor-macos-arm64
+./traffic-monitor-macos-arm64
+```
+
+如果你是从源码本地编译，也可以直接这样运行：
+
+```bash
+go build -o traffic-monitor main.go
+./traffic-monitor
 ```
 
 启动后访问：
@@ -73,6 +79,13 @@ MIHOMO_URL=http://127.0.0.1:9090 ./traffic-monitor-macos-arm64
 ```text
 http://localhost:8080/
 ```
+
+如果本地还没有保存过 Mihomo 配置，首次打开页面会提示填写：
+
+- `Mihomo URL`
+- `Secret`（如果 Mihomo 没有设置密钥，可以留空）
+
+保存后会立即生效，并持久化到本地 SQLite。后续也可以在页面右上角继续修改这两个值。
 
 ### Docker 运行
 
@@ -91,11 +104,17 @@ docker run -d \
 
 如果 Mihomo 没有设置密钥，可以把 `MIHOMO_SECRET` 留空。
 
+升级兼容说明：
+
+- 旧版 Docker 用户升级后，如果启动参数里仍然传了 `MIHOMO_URL` / `MIHOMO_SECRET`，新版本会继续直接使用这些值，不会影响启动。
+- 启动时只要环境变量里有值，就会以环境变量为准，并自动保存到数据库。
+- 如果后续移除了环境变量，但保留了 `/data` 挂载目录，服务会回退使用数据库里上次保存的值。
+
 ## 常用配置
 
 | 变量名 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MIHOMO_URL` | `http://127.0.0.1:9090` | Mihomo Controller 地址 |
+| `MIHOMO_URL` | 空 | 启动时优先使用的 Mihomo Controller 地址；未设置时可在页面首次打开后填写 |
 | `MIHOMO_SECRET` | 空 | Mihomo Bearer Token |
 | `TRAFFIC_MONITOR_LISTEN` | `:8080` | 服务监听地址 |
 

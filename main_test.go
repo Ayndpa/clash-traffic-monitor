@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
@@ -130,8 +132,8 @@ func TestLoadConfigDefaultsRetentionPolicy(t *testing.T) {
 	if cfg.ListenAddr != ":8080" {
 		t.Fatalf("expected listen addr default to be :8080, got %q", cfg.ListenAddr)
 	}
-	if cfg.MihomoURL != "http://127.0.0.1:9090" {
-		t.Fatalf("expected mihomo url default to be http://127.0.0.1:9090, got %q", cfg.MihomoURL)
+	if cfg.MihomoURL != "" {
+		t.Fatalf("expected mihomo url default to be empty, got %q", cfg.MihomoURL)
 	}
 	if cfg.MihomoSecret != "" {
 		t.Fatalf("expected mihomo secret default to be empty, got %q", cfg.MihomoSecret)
@@ -143,6 +145,70 @@ func TestLoadConfigDefaultsRetentionPolicy(t *testing.T) {
 	})
 	if defaultDatabasePath() != "./data/traffic_monitor.db" {
 		t.Fatalf("expected local default database path to be ./data/traffic_monitor.db, got %q", defaultDatabasePath())
+	}
+}
+
+func TestResolveMihomoSettingsUsesEnvironmentAndPersists(t *testing.T) {
+	db, err := openDatabase(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatalf("openDatabase: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+
+	if err := saveMihomoSettings(db, mihomoSettings{
+		URL:    "http://db.example:9090",
+		Secret: "db-secret",
+	}); err != nil {
+		t.Fatalf("saveMihomoSettings: %v", err)
+	}
+
+	got, err := resolveMihomoSettings(db, "http://env.example:9090/", "env-secret")
+	if err != nil {
+		t.Fatalf("resolveMihomoSettings: %v", err)
+	}
+
+	if got.URL != "http://env.example:9090" {
+		t.Fatalf("expected env url to win, got %q", got.URL)
+	}
+	if got.Secret != "env-secret" {
+		t.Fatalf("expected env secret to win, got %q", got.Secret)
+	}
+
+	stored, err := loadMihomoSettings(db)
+	if err != nil {
+		t.Fatalf("loadMihomoSettings: %v", err)
+	}
+	if stored != got {
+		t.Fatalf("expected stored settings to match resolved settings, got %+v want %+v", stored, got)
+	}
+}
+
+func TestResolveMihomoSettingsFallsBackToStoredValues(t *testing.T) {
+	db, err := openDatabase(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatalf("openDatabase: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+
+	want := mihomoSettings{
+		URL:    "http://stored.example:9090",
+		Secret: "stored-secret",
+	}
+	if err := saveMihomoSettings(db, want); err != nil {
+		t.Fatalf("saveMihomoSettings: %v", err)
+	}
+
+	got, err := resolveMihomoSettings(db, "", "")
+	if err != nil {
+		t.Fatalf("resolveMihomoSettings: %v", err)
+	}
+
+	if got != want {
+		t.Fatalf("expected stored settings fallback, got %+v want %+v", got, want)
 	}
 }
 
@@ -259,6 +325,82 @@ func TestProcessConnectionsBuffersAggregatesWithoutPersistingRawLogs(t *testing.
 		if entry.Upload != 128 || entry.Download != 256 || entry.Count != 1 {
 			t.Fatalf("unexpected aggregate totals: %+v", entry)
 		}
+	}
+}
+
+func TestCollectOnceSkipsPollingWhenMihomoURLIsUnset(t *testing.T) {
+	svc := newTestService(t)
+	svc.client = &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			t.Fatalf("unexpected outbound request when mihomo url is unset")
+			return nil, nil
+		}),
+	}
+	svc.setMihomoSettings(mihomoSettings{})
+
+	svc.collectOnce(context.Background())
+}
+
+func TestHandleMihomoSettingsRoundTrip(t *testing.T) {
+	svc := newTestService(t)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/settings/mihomo", bytes.NewBufferString(`{"url":"http://127.0.0.1:9090/","secret":"test-secret"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	svc.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected put status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var updated mihomoSettings
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decode put response: %v", err)
+	}
+	if updated.URL != "http://127.0.0.1:9090" {
+		t.Fatalf("expected trailing slash to be trimmed, got %q", updated.URL)
+	}
+	if updated.Secret != "test-secret" {
+		t.Fatalf("expected updated secret in response, got %q", updated.Secret)
+	}
+
+	stored, err := loadMihomoSettings(svc.db)
+	if err != nil {
+		t.Fatalf("loadMihomoSettings: %v", err)
+	}
+	if stored != updated {
+		t.Fatalf("expected persisted settings to match response, got %+v want %+v", stored, updated)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/api/settings/mihomo", nil)
+	getRec := httptest.NewRecorder()
+	svc.routes().ServeHTTP(getRec, getReq)
+
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("unexpected get status: %d body=%s", getRec.Code, getRec.Body.String())
+	}
+
+	var fetched mihomoSettings
+	if err := json.Unmarshal(getRec.Body.Bytes(), &fetched); err != nil {
+		t.Fatalf("decode get response: %v", err)
+	}
+	if fetched != updated {
+		t.Fatalf("expected get response to match updated settings, got %+v want %+v", fetched, updated)
+	}
+}
+
+func TestHandleMihomoSettingsRejectsEmptyURL(t *testing.T) {
+	svc := newTestService(t)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/settings/mihomo", bytes.NewBufferString(`{"url":"   ","secret":""}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	svc.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request for empty mihomo url, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -560,8 +702,17 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 	if strings.Contains(html, "setInterval(loadData, 30000)") {
 		t.Fatalf("expected periodic auto refresh to be removed")
 	}
-	if !strings.Contains(html, "updateCustomInputs()\n      updateViewHints()\n      loadData()") {
-		t.Fatalf("expected initial page load to fetch data once")
+	if !strings.Contains(html, "await loadSettings()") {
+		t.Fatalf("expected initial page boot to load saved mihomo settings before fetching data")
+	}
+	if !strings.Contains(html, "if (state.settingsRequired)") || !strings.Contains(html, "await loadData()") {
+		t.Fatalf("expected initial page boot to gate data loading on saved mihomo settings")
+	}
+	if !strings.Contains(html, `id="settingsPanel"`) || !strings.Contains(html, `id="settingsBtn"`) {
+		t.Fatalf("expected embedded index.html to include mihomo settings entry points")
+	}
+	if !strings.Contains(html, `sendJSON("/api/settings/mihomo", "PUT", payload)`) {
+		t.Fatalf("expected embedded index.html to save mihomo settings through the settings API")
 	}
 	for _, label := range []string{"1 天", "7 天", "15 天", "30 天", "自定义"} {
 		if !strings.Contains(html, label) {
@@ -689,4 +840,10 @@ func insertTestAggregates(t *testing.T, db *sql.DB, entries []aggregatedEntry) {
 			t.Fatalf("insert aggregate: %v", err)
 		}
 	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
 }

@@ -29,7 +29,6 @@ var webAssets embed.FS
 
 const (
 	defaultListenAddr      = ":8080"
-	defaultMihomoURL       = "http://127.0.0.1:9090"
 	defaultPollInterval    = 5 * time.Second
 	aggregateFlushInterval = 10 * time.Minute
 	aggregateRetention     = 30 * 24 * time.Hour
@@ -45,6 +44,11 @@ type config struct {
 	ListenAddr   string
 	MihomoURL    string
 	MihomoSecret string
+}
+
+type mihomoSettings struct {
+	URL    string `json:"url"`
+	Secret string `json:"secret"`
 }
 
 type trafficLog struct {
@@ -109,6 +113,7 @@ type service struct {
 	client            *http.Client
 	cfg               config
 	mu                sync.Mutex
+	mihomoSettings    mihomoSettings
 	lastConnections   map[string]connection
 	lastUploadTotal   int64
 	lastDownloadTotal int64
@@ -143,10 +148,16 @@ func main() {
 	}
 	defer db.Close()
 
+	runtimeSettings, err := resolveMihomoSettings(db, cfg.MihomoURL, cfg.MihomoSecret)
+	if err != nil {
+		log.Fatalf("resolve mihomo settings: %v", err)
+	}
+
 	svc := &service{
 		db:              db,
 		client:          &http.Client{Timeout: 10 * time.Second},
 		cfg:             cfg,
+		mihomoSettings:  runtimeSettings,
 		lastConnections: make(map[string]connection),
 		lastVacuum:      time.Now(),
 		aggregateBuffer: make(map[string]*aggregatedEntry),
@@ -198,12 +209,8 @@ func main() {
 func loadConfig() (config, error) {
 	cfg := config{
 		ListenAddr:   getenv("TRAFFIC_MONITOR_LISTEN", defaultListenAddr),
-		MihomoURL:    strings.TrimRight(getenv("MIHOMO_URL", defaultMihomoURL), "/"),
+		MihomoURL:    strings.TrimRight(getenv("MIHOMO_URL", ""), "/"),
 		MihomoSecret: getenv("MIHOMO_SECRET", ""),
-	}
-
-	if cfg.MihomoURL == "" {
-		return config{}, errors.New("MIHOMO_URL is required")
 	}
 
 	return cfg, nil
@@ -270,6 +277,11 @@ func openDatabase(path string) (*sql.DB, error) {
 	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_host ON traffic_aggregated(host);
 	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_process ON traffic_aggregated(process);
 	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_outbound ON traffic_aggregated(outbound);
+
+	CREATE TABLE IF NOT EXISTS app_settings (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL DEFAULT ''
+	);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -294,6 +306,91 @@ func openDatabase(path string) (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+func normalizeMihomoSettings(settings mihomoSettings) mihomoSettings {
+	settings.URL = strings.TrimRight(strings.TrimSpace(settings.URL), "/")
+	settings.Secret = strings.TrimSpace(settings.Secret)
+	return settings
+}
+
+func loadMihomoSettings(db *sql.DB) (mihomoSettings, error) {
+	rows, err := db.Query(`SELECT key, value FROM app_settings WHERE key IN ('mihomo_url', 'mihomo_secret')`)
+	if err != nil {
+		return mihomoSettings{}, err
+	}
+	defer rows.Close()
+
+	var settings mihomoSettings
+	for rows.Next() {
+		var (
+			key   string
+			value string
+		)
+		if err := rows.Scan(&key, &value); err != nil {
+			return mihomoSettings{}, err
+		}
+		switch key {
+		case "mihomo_url":
+			settings.URL = value
+		case "mihomo_secret":
+			settings.Secret = value
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return mihomoSettings{}, err
+	}
+
+	return normalizeMihomoSettings(settings), nil
+}
+
+func saveMihomoSettings(db *sql.DB, settings mihomoSettings) error {
+	settings = normalizeMihomoSettings(settings)
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+
+	for key, value := range map[string]string{
+		"mihomo_url":    settings.URL,
+		"mihomo_secret": settings.Secret,
+	} {
+		if _, err := tx.Exec(`
+			INSERT INTO app_settings (key, value)
+			VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value
+		`, key, value); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func resolveMihomoSettings(db *sql.DB, envURL, envSecret string) (mihomoSettings, error) {
+	stored, err := loadMihomoSettings(db)
+	if err != nil {
+		return mihomoSettings{}, err
+	}
+
+	resolved := stored
+	if strings.TrimSpace(envURL) != "" {
+		resolved.URL = envURL
+	}
+	if strings.TrimSpace(envSecret) != "" {
+		resolved.Secret = envSecret
+	}
+	resolved = normalizeMihomoSettings(resolved)
+
+	if strings.TrimSpace(envURL) != "" || strings.TrimSpace(envSecret) != "" {
+		if err := saveMihomoSettings(db, resolved); err != nil {
+			return mihomoSettings{}, err
+		}
+	}
+
+	return resolved, nil
 }
 
 func backfillAggregatedLogs(db *sql.DB, beforeMS int64) error {
@@ -357,7 +454,12 @@ func (s *service) runCollector(ctx context.Context) {
 }
 
 func (s *service) collectOnce(ctx context.Context) {
-	resp, err := s.fetchConnections(ctx)
+	settings := s.currentMihomoSettings()
+	if settings.URL == "" {
+		return
+	}
+
+	resp, err := s.fetchConnections(ctx, settings)
 	if err != nil {
 		log.Printf("poll Mihomo connections: %v", err)
 		return
@@ -368,17 +470,56 @@ func (s *service) collectOnce(ctx context.Context) {
 	}
 }
 
-func (s *service) fetchConnections(ctx context.Context) (*connectionsResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.MihomoURL+"/connections", nil)
+func (s *service) currentMihomoSettings() mihomoSettings {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mihomoSettings
+}
+
+func (s *service) setMihomoSettings(settings mihomoSettings) {
+	settings = normalizeMihomoSettings(settings)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if settings != s.mihomoSettings {
+		s.lastConnections = make(map[string]connection)
+		s.lastUploadTotal = 0
+		s.lastDownloadTotal = 0
+	}
+
+	s.mihomoSettings = settings
+}
+
+func (s *service) updateMihomoSettings(settings mihomoSettings) error {
+	settings = normalizeMihomoSettings(settings)
+	if err := saveMihomoSettings(s.db, settings); err != nil {
+		return err
+	}
+	s.setMihomoSettings(settings)
+	return nil
+}
+
+func (s *service) fetchConnections(ctx context.Context, settings mihomoSettings) (*connectionsResponse, error) {
+	if settings.URL == "" {
+		return nil, errors.New("mihomo url is not configured")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, settings.URL+"/connections", nil)
 	if err != nil {
 		return nil, err
 	}
 
-	if s.cfg.MihomoSecret != "" {
-		req.Header.Set("Authorization", "Bearer "+s.cfg.MihomoSecret)
+	if settings.Secret != "" {
+		req.Header.Set("Authorization", "Bearer "+settings.Secret)
 	}
 
-	resp, err := s.client.Do(req)
+	client := s.client
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -664,6 +805,7 @@ func (s *service) routes() http.Handler {
 	mux.HandleFunc("/LICENSE", s.handleLicense)
 	mux.Handle("/", fileServer)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/api/settings/mihomo", s.handleMihomoSettings)
 	mux.HandleFunc("/api/traffic/aggregate", s.handleAggregate)
 	mux.HandleFunc("/api/traffic/substats", s.handleSubstats)
 	mux.HandleFunc("/api/traffic/proxy-stats", s.handleProxyStats)
@@ -679,7 +821,7 @@ func (s *service) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", defaultAllowedOrigin)
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -710,6 +852,34 @@ func (s *service) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *service) handleMihomoSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.currentMihomoSettings())
+	case http.MethodPut:
+		var payload mihomoSettings
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("invalid json body"))
+			return
+		}
+
+		payload = normalizeMihomoSettings(payload)
+		if payload.URL == "" {
+			writeError(w, http.StatusBadRequest, errors.New("mihomo url is required"))
+			return
+		}
+
+		if err := s.updateMihomoSettings(payload); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		writeJSON(w, http.StatusOK, s.currentMihomoSettings())
+	default:
+		writeMethodNotAllowed(w)
+	}
 }
 
 func (s *service) handleAggregate(w http.ResponseWriter, r *http.Request) {
