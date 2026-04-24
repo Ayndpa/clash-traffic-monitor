@@ -19,11 +19,13 @@
             <div class="dimension-tabs" role="tablist" aria-label="聚合维度">
               <button class="dimension-tab active" type="button" data-dimension="sourceIP">设备</button>
               <button class="dimension-tab" type="button" data-dimension="host">主机</button>
+              <button class="dimension-tab" type="button" data-dimension="process">进程</button>
               <button class="dimension-tab" type="button" data-dimension="outbound">代理</button>
             </div>
             <select id="dimension" class="hidden-select" aria-hidden="true" tabindex="-1">
               <option value="sourceIP">设备</option>
               <option value="host">目标主机</option>
+              <option value="process">运行进程</option>
               <option value="outbound">出口节点</option>
             </select>
           </div>
@@ -49,12 +51,25 @@
                 <input id="end" type="datetime-local" />
               </div>
             </div>
+            <button id="logsBtn" class="toolbar-action ghost" type="button">运行日志</button>
             <button id="settingsBtn" class="toolbar-action ghost" type="button">连接设置</button>
             <button id="refreshBtn" class="toolbar-action primary" type="button">刷新</button>
             <button id="clearBtn" class="toolbar-action danger" type="button">清空</button>
           </div>
         </div>
       </section>
+
+      <div id="logsModal" class="modal hidden">
+        <div class="modal-content log-modal-content">
+          <div class="modal-header">
+            <h3>运行日志</h3>
+            <button id="closeLogsBtn" class="modal-close">&times;</button>
+          </div>
+          <div id="logsContainer" class="logs-container">
+            <div class="empty">加载中...</div>
+          </div>
+        </div>
+      </div>
 
       <section id="statusBanner" class="panel status-banner hidden" role="status" aria-live="polite"></section>
 

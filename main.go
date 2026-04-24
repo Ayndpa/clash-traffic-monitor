@@ -21,8 +21,13 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/getlantern/systray"
+	"github.com/pkg/browser"
+	_ "modernc.org/sqlite"
 )
+
+//go:embed icon.png
+var trayIcon []byte
 
 //go:embed LICENSE web/*
 var webAssets embed.FS
@@ -122,6 +127,28 @@ type service struct {
 	aggregateBuffer   map[string]*aggregatedEntry
 }
 
+type logBuffer struct {
+	mu   sync.Mutex
+	logs []string
+}
+
+func (lb *logBuffer) Write(p []byte) (n int, err error) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	msg := string(p)
+	lb.logs = append(lb.logs, msg)
+	if len(lb.logs) > 500 {
+		lb.logs = lb.logs[1:]
+	}
+	return os.Stderr.Write(p)
+}
+
+var globalLogBuffer = &logBuffer{}
+
+func init() {
+	log.SetOutput(globalLogBuffer)
+}
+
 type aggregatedEntry struct {
 	BucketStart   int64
 	BucketEnd     int64
@@ -137,6 +164,10 @@ type aggregatedEntry struct {
 }
 
 func main() {
+	systray.Run(onReady, onExit)
+}
+
+func onReady() {
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatalf("load config: %v", err)
@@ -146,7 +177,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("open database: %v", err)
 	}
-	defer db.Close()
 
 	runtimeSettings, err := resolveMihomoSettings(db, cfg.MihomoURL, cfg.MihomoSecret)
 	if err != nil {
@@ -163,8 +193,15 @@ func main() {
 		aggregateBuffer: make(map[string]*aggregatedEntry),
 	}
 
+	systray.SetIcon(trayIcon)
+	systray.SetTitle("Traffic Monitor")
+	systray.SetTooltip("Clash Traffic Monitor")
+
+	mOpen := systray.AddMenuItem("打开面板", "在浏览器中打开监控面板")
+	systray.AddSeparator()
+	mQuit := systray.AddMenuItem("退出", "关闭服务")
+
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	collectorDone := make(chan struct{})
 	go func() {
@@ -181,28 +218,63 @@ func main() {
 	go func() {
 		log.Printf("traffic monitor listening on %s", cfg.ListenAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("http server: %v", err)
+			log.Printf("http server error: %v", err)
 		}
 	}()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
+	go func() {
+		for {
+			select {
+			case <-mOpen.ClickedCh:
+				addr := cfg.ListenAddr
+				if strings.HasPrefix(addr, ":") {
+					addr = "127.0.0.1" + addr
+				}
+				if !strings.HasPrefix(addr, "http") {
+					addr = "http://" + addr
+				}
+				browser.OpenURL(addr)
+			case <-mQuit.ClickedCh:
+				systray.Quit()
+				return
+			}
+		}
+	}()
 
-	cancel()
-	select {
-	case <-collectorDone:
-	case <-time.After(5 * time.Second):
-		log.Printf("collector shutdown timed out")
-	}
-	if err := svc.flushAggregateBuffer(); err != nil {
-		log.Printf("flush aggregate buffer on shutdown: %v", err)
-	}
+	// Handle signals for graceful shutdown even in tray mode
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		systray.Quit()
+	}()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown server: %v", err)
+	// We need to keep a reference to the cleanup logic for onExit
+	systrayOnExit = func() {
+		cancel()
+		select {
+		case <-collectorDone:
+		case <-time.After(5 * time.Second):
+			log.Printf("collector shutdown timed out")
+		}
+		if err := svc.flushAggregateBuffer(); err != nil {
+			log.Printf("flush aggregate buffer on shutdown: %v", err)
+		}
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown server: %v", err)
+		}
+		db.Close()
+	}
+}
+
+var systrayOnExit func()
+
+func onExit() {
+	if systrayOnExit != nil {
+		systrayOnExit()
 	}
 }
 
@@ -228,7 +300,7 @@ func openDatabase(path string) (*sql.DB, error) {
 		return nil, err
 	}
 
-	db, err := sql.Open("sqlite3", path)
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
@@ -814,6 +886,7 @@ func (s *service) routes() http.Handler {
 	mux.HandleFunc("/api/traffic/details", s.handleConnectionDetails)
 	mux.HandleFunc("/api/traffic/trend", s.handleTrend)
 	mux.HandleFunc("/api/traffic/logs", s.handleLogs)
+	mux.HandleFunc("/api/app/logs", s.handleAppLogs)
 	return s.withCORS(mux)
 }
 
@@ -1098,6 +1171,16 @@ func (s *service) handleLogs(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *service) handleAppLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w)
+		return
+	}
+	globalLogBuffer.mu.Lock()
+	defer globalLogBuffer.mu.Unlock()
+	writeJSON(w, http.StatusOK, globalLogBuffer.logs)
 }
 
 func (s *service) queryAggregate(dimension string, start, end int64) ([]aggregatedData, error) {

@@ -23,6 +23,14 @@ const drilldownConfig = {
     buildDetailTitle: (primary, secondary) =>
       primary && secondary ? `${primary} / ${secondary} 的连接明细` : "连接明细",
   },
+  process: {
+    countLabel: "进程",
+    primaryTitle: "进程排行",
+    secondaryColumn: "访问主机",
+    buildSecondaryTitle: (primary) => (primary ? `${primary} 访问的主机` : "访问主机"),
+    buildDetailTitle: (primary, secondary) =>
+      primary && secondary ? `${primary} / ${secondary} 的连接明细` : "连接明细",
+  },
 }
 
 const DIMENSION_STORAGE_KEY = "traffic-monitor:selected-dimension"
@@ -67,6 +75,10 @@ const elements = {
   detailSearch: document.getElementById("detailSearch"),
   secondaryBody: document.getElementById("secondaryBody"),
   detailCards: document.getElementById("detailCards"),
+  logsBtn: document.getElementById("logsBtn"),
+  logsModal: document.getElementById("logsModal"),
+  closeLogsBtn: document.getElementById("closeLogsBtn"),
+  logsContainer: document.getElementById("logsContainer"),
 }
 
 const state = {
@@ -87,6 +99,7 @@ const state = {
   },
   settingsOpen: false,
   settingsRequired: false,
+  logsOpen: false,
 }
 
 function isValidDimension(value) {
@@ -324,6 +337,30 @@ async function sendJSON(path, method, payload) {
   return response.json()
 }
 
+async function loadAppLogs() {
+  if (!state.logsOpen) return
+  try {
+    const logs = await fetchJSON("/api/app/logs")
+    elements.logsContainer.innerHTML = logs
+      .map((msg) => `<div class="log-entry">${escapeHTML(msg)}</div>`)
+      .join("")
+    elements.logsContainer.scrollTop = elements.logsContainer.scrollHeight
+  } catch (error) {
+    console.error("Failed to load app logs", error)
+  }
+}
+
+function openLogsModal() {
+  state.logsOpen = true
+  elements.logsModal.classList.remove("hidden")
+  loadAppLogs()
+}
+
+function closeLogsModal() {
+  state.logsOpen = false
+  elements.logsModal.classList.add("hidden")
+}
+
 function syncSettingsForm() {
   elements.settingsUrl.value = state.mihomoSettings.url || ""
   elements.settingsSecret.value = state.mihomoSettings.secret || ""
@@ -502,6 +539,7 @@ function renderDetails(rows) {
           </div>
           <div class="detail-card-meta">
             <span title="${escapeHTML(row.sourceIP || "Inner")}">${escapeHTML(row.sourceIP || "Inner")}</span>
+            <span title="${escapeHTML(row.process || "Unknown")}">${escapeHTML(row.process || "Unknown")}</span>
             <span title="${escapeHTML(row.outbound || "DIRECT")}">${escapeHTML(row.outbound || "DIRECT")}</span>
           </div>
           <div class="detail-card-meta">
@@ -977,6 +1015,15 @@ async function initializeApp() {
   renderTrend([])
   resetDetailPanels()
 
+  elements.settingsBtn.addEventListener("click", openSettingsPanel)
+  elements.settingsCancelBtn.addEventListener("click", closeSettingsPanel)
+  elements.settingsForm.addEventListener("submit", saveSettings)
+  elements.logsBtn.addEventListener("click", openLogsModal)
+  elements.closeLogsBtn.addEventListener("click", closeLogsModal)
+  elements.logsModal.addEventListener("click", (e) => {
+    if (e.target === elements.logsModal) closeLogsModal()
+  })
+
   try {
     await loadSettings()
     if (state.settingsRequired) {
@@ -991,6 +1038,9 @@ async function initializeApp() {
     syncSettingsUI()
     setStatus(error.message || "加载 Mihomo 设置失败", true)
   }
+
+  setInterval(loadData, 30000)
+  setInterval(loadAppLogs, 3000)
 }
 
 initializeApp()
