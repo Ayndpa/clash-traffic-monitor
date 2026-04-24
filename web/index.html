@@ -133,6 +133,18 @@
                 autocomplete="off"
               />
             </label>
+            <label class="settings-field">
+              <span>日志保留时长 (小时)</span>
+              <input
+                id="settingsRetention"
+                type="number"
+                min="1"
+                max="8760"
+                placeholder="默认 720 小时"
+                autocomplete="off"
+                required
+              />
+            </label>
             <div class="settings-actions">
               <button id="settingsSaveBtn" class="toolbar-action primary" type="submit">
                 保存并连接

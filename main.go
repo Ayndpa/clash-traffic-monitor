@@ -52,8 +52,9 @@ type config struct {
 }
 
 type mihomoSettings struct {
-	URL    string `json:"url"`
-	Secret string `json:"secret"`
+	URL            string `json:"url"`
+	Secret         string `json:"secret"`
+	RetentionHours int    `json:"retentionHours"`
 }
 
 type trafficLog struct {
@@ -387,13 +388,13 @@ func normalizeMihomoSettings(settings mihomoSettings) mihomoSettings {
 }
 
 func loadMihomoSettings(db *sql.DB) (mihomoSettings, error) {
-	rows, err := db.Query(`SELECT key, value FROM app_settings WHERE key IN ('mihomo_url', 'mihomo_secret')`)
+	rows, err := db.Query(`SELECT key, value FROM app_settings WHERE key IN ('mihomo_url', 'mihomo_secret', 'mihomo_retention_days')`)
 	if err != nil {
 		return mihomoSettings{}, err
 	}
 	defer rows.Close()
 
-	var settings mihomoSettings
+	settings := mihomoSettings{RetentionHours: 720}
 	for rows.Next() {
 		var (
 			key   string
@@ -407,6 +408,10 @@ func loadMihomoSettings(db *sql.DB) (mihomoSettings, error) {
 			settings.URL = value
 		case "mihomo_secret":
 			settings.Secret = value
+		case "mihomo_retention_days":
+			if hours, err := strconv.Atoi(value); err == nil && hours > 0 {
+				settings.RetentionHours = hours
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -425,8 +430,9 @@ func saveMihomoSettings(db *sql.DB, settings mihomoSettings) error {
 	}
 
 	for key, value := range map[string]string{
-		"mihomo_url":    settings.URL,
-		"mihomo_secret": settings.Secret,
+		"mihomo_url":            settings.URL,
+		"mihomo_secret":         settings.Secret,
+		"mihomo_retention_days": strconv.Itoa(settings.RetentionHours),
 	} {
 		if _, err := tx.Exec(`
 			INSERT INTO app_settings (key, value)
@@ -737,7 +743,14 @@ func (s *service) cleanupOldLogs(nowMS int64) error {
 		return err
 	}
 
-	aggCutoff := nowMS - int64(aggregateRetention/time.Millisecond)
+	retentionHours := 720
+	s.mu.Lock()
+	if s.mihomoSettings.RetentionHours > 0 {
+		retentionHours = s.mihomoSettings.RetentionHours
+	}
+	s.mu.Unlock()
+
+	aggCutoff := nowMS - int64(time.Duration(retentionHours)*time.Hour/time.Millisecond)
 	if _, err := s.db.Exec(`DELETE FROM traffic_aggregated WHERE bucket_end < ?`, aggCutoff); err != nil {
 		return err
 	}

@@ -53,6 +53,7 @@ const elements = {
   settingsForm: document.getElementById("settingsForm"),
   settingsUrl: document.getElementById("settingsUrl"),
   settingsSecret: document.getElementById("settingsSecret"),
+  settingsRetention: document.getElementById("settingsRetention"),
   settingsSaveBtn: document.getElementById("settingsSaveBtn"),
   settingsCancelBtn: document.getElementById("settingsCancelBtn"),
   settingsBtn: document.getElementById("settingsBtn"),
@@ -96,6 +97,7 @@ const state = {
   mihomoSettings: {
     url: "",
     secret: "",
+    retentionHours: 720,
   },
   settingsOpen: false,
   settingsRequired: false,
@@ -364,6 +366,7 @@ function closeLogsModal() {
 function syncSettingsForm() {
   elements.settingsUrl.value = state.mihomoSettings.url || ""
   elements.settingsSecret.value = state.mihomoSettings.secret || ""
+  elements.settingsRetention.value = state.mihomoSettings.retentionHours || 720
 }
 
 function syncSettingsUI() {
@@ -420,6 +423,7 @@ async function saveSettings(event) {
   const payload = {
     url: elements.settingsUrl.value.trim(),
     secret: elements.settingsSecret.value.trim(),
+    retentionHours: parseInt(elements.settingsRetention.value) || 720,
   }
 
   elements.settingsSaveBtn.disabled = true
@@ -430,6 +434,7 @@ async function saveSettings(event) {
     state.mihomoSettings = {
       url: saved.url || "",
       secret: saved.secret || "",
+      retentionHours: saved.retentionHours || 720,
     }
     state.settingsRequired = !state.mihomoSettings.url
     state.settingsOpen = false
