@@ -40,7 +40,7 @@
 
 ## 页面预览
 
-![Traffic Monitor 页面预览](./readmeImg/image.png)
+![Traffic Monitor 页面预览](./readmeImg/99898073-ec14-4e4a-8992-1b2a2e36082a.png)
 
 ## 功能特性
 
