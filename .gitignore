@@ -11,3 +11,5 @@ __debug*
 .idea/
 .docs/
 /traffic-monitor
+publish_release.go
+traffic-monitor.exe
